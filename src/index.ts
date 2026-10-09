@@ -152,17 +152,26 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
     networkList.push(...container.Labels["tj.horner.dragonify.networks"].split(','))
   }
 
-  // Named after the compose project, which Docker keeps unique, so two apps
-  // can't end up sharing one. traefik.docker.network must match it so Traefik
-  // routes over this network.
-  const isolatedNetwork = `traefik-${container.Labels["com.docker.compose.project"]}`
-  const isolated = isTraefikIsolated(container) && container.Labels["traefik.docker.network"] === isolatedNetwork
-  if (isTraefikIsolated(container) && !isolated) {
-    logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but needs traefik.docker.network=${isolatedNetwork}, skipping isolated network`)
-  }
-  if (isolated) {
-    await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: "true" })
-    networkList.push(isolatedNetwork)
+  // The network named by traefik.docker.network (which Traefik routes over) is
+  // claimed by the first service to use it. Any other service naming it, or a
+  // network Dragonify didn't create, is refused so isolation can't silently
+  // become sharing.
+  const isolatedNetwork = container.Labels["traefik.docker.network"]
+  const owner = `${container.Labels["com.docker.compose.project"]}/${container.Labels["com.docker.compose.service"]}`
+  let isolated = false
+  if (isTraefikIsolated(container)) {
+    if (!isolatedNetwork) {
+      logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but no traefik.docker.network label, skipping isolated network`)
+    } else {
+      await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: owner })
+      const claimedBy = (await docker.getNetwork(isolatedNetwork).inspect()).Labels?.[ISOLATED_LABEL]
+      if (claimedBy === owner) {
+        isolated = true
+        networkList.push(isolatedNetwork)
+      } else {
+        logger.error(`${container.Names} wants isolated network "${isolatedNetwork}", but it ${claimedBy ? `belongs to ${claimedBy}` : "was not created by Dragonify"}; not connecting. Pick a unique traefik.docker.network name.`)
+      }
+    }
   }
 
   for (const network_name of networkList) {
@@ -241,7 +250,7 @@ async function removeEmptyCreatedNetwork(docker: Docker) {
     const network = await docker.getNetwork(networkSummary.Id).inspect()
     const containers = network.Containers ?? {}
     // An isolated network counts as empty once only Traefik is left on it.
-    const traefikIds = network.Labels[ISOLATED_LABEL] === "true"
+    const traefikIds = network.Labels[ISOLATED_LABEL]
       ? Object.keys(containers).filter(id => containers[id].Name === TRAEFIK_CONTAINER)
       : []
     const isEmpty = Object.keys(containers).length === traefikIds.length
@@ -280,13 +289,18 @@ async function main() {
     connectNewContainerToAppsNetwork(docker, event.Actor["ID"])
   })
 
+  // Several containers stop at once on compose down; run cleanups one at a
+  // time so two don't race to disconnect Traefik from the same network.
+  let cleanup = Promise.resolve()
   events.on("container.stop", (event) => {
     const containerAttributes = event.Actor.Attributes
     if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    removeEmptyCreatedNetwork(docker)
+    cleanup = cleanup
+      .then(() => removeEmptyCreatedNetwork(docker))
+      .catch(e => { logger.error("Network cleanup failed:", e) })
   })
 }
 

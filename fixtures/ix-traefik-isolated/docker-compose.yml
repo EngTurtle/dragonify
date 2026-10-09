@@ -1,21 +1,26 @@
-# Run a container named "traefik" first, e.g.
-#   docker run -d --name traefik --network none alpine sleep infinity
-# then `docker compose -p ix-traefik-isolated up -d`. "web" should end up on
-# its own network with only Traefik; "other" should not be able to reach it.
+# Run a container named "traefik" on any bridge network first, e.g.
+#   docker run -d --name traefik alpine sleep infinity
+# then `docker compose -p ix-traefik-isolated up -d`. "web" and "web2"
+# should each end up on their own network with only Traefik; "copycat"
+# names web's network and should be refused with an error.
 services:
   web:
     image: nginx:alpine
     labels:
       traefik.enable: "true"
-      traefik.docker.network: traefik-ix-traefik-isolated
+      traefik.docker.network: traefik-test-web
       tj.horner.dragonify.traefik-isolated: "true"
-  wrong-name:
-    # Should log a warning and get no isolated network.
+  web2:
+    # Same stack as web, but gets its own network.
     image: nginx:alpine
     labels:
       traefik.enable: "true"
-      traefik.docker.network: traefik-ix-someone-else
+      traefik.docker.network: traefik-test-web2
       tj.horner.dragonify.traefik-isolated: "true"
-  other:
-    image: alpine
-    command: sleep infinity
+  copycat:
+    image: nginx:alpine
+    depends_on: [web]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-test-web
+      tj.horner.dragonify.traefik-isolated: "true"
