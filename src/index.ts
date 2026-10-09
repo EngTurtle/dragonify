@@ -5,8 +5,16 @@ import { logger } from "./logger"
 const NETWORK_NAME = "apps-internal"
 const CONNECT_ALL_ENABLE: string | undefined = process.env.CONNECT_ALL
 const CUSTOM_NETWORK_NAMES: string | undefined = process.env.CUSTOMS_NETWORKS
-const TRAEFIK_CONTAINER = process.env.TRAEFIK_CONTAINER ?? "traefik"
-const ISOLATED_LABEL = "tj.horner.dragonify.traefik-isolated"
+const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
+const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
+const REV_PROXY_NETWORK_MATCH = new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "")
+const REV_PROXY_CONTAINER = process.env.REV_PROXY_CONTAINER
+if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
+  throw new Error("REV_PROXY_NETWORKS=true needs REV_PROXY_NETWORK_LABEL and REV_PROXY_CONTAINER")
+}
+// Set on networks Dragonify creates for the reverse proxy; the value is the
+// project/service that first asked for the network.
+const REV_PROXY_NETWORK_OWNER_LABEL = "tj.horner.dragonify.rev-proxy-network"
 
 
 if (CONNECT_ALL_ENABLE !== undefined) {
@@ -138,8 +146,9 @@ function isNetworkSpecified(container: Docker.ContainerInfo) {
   return container.Labels["tj.horner.dragonify.networks"] !== undefined
 }
 
-function isTraefikIsolated(container: Docker.ContainerInfo) {
-  return container.Labels[ISOLATED_LABEL] === "true" && container.Labels["traefik.enable"] === "true"
+function getRevProxyNetwork(container: Docker.ContainerInfo) {
+  const name = container.Labels[REV_PROXY_NETWORK_LABEL!]
+  return REV_PROXY_NETWORKS && name && REV_PROXY_NETWORK_MATCH.test(name) ? name : undefined
 }
 
 async function connectContainer(docker: Docker, container: Docker.ContainerInfo) {
@@ -152,26 +161,18 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
     networkList.push(...container.Labels["tj.horner.dragonify.networks"].split(','))
   }
 
-  // The network named by traefik.docker.network (which Traefik routes over) is
-  // claimed by the first service to use it. Any other service naming it, or a
-  // network Dragonify didn't create, is refused so isolation can't silently
-  // become sharing.
-  const isolatedNetwork = container.Labels["traefik.docker.network"]
-  const owner = `${container.Labels["com.docker.compose.project"]}/${container.Labels["com.docker.compose.service"]}`
-  let isolated = false
-  if (isTraefikIsolated(container)) {
-    if (!isolatedNetwork) {
-      logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but no traefik.docker.network label, skipping isolated network`)
-    } else {
-      await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: owner })
-      const claimedBy = (await docker.getNetwork(isolatedNetwork).inspect()).Labels?.[ISOLATED_LABEL]
-      if (claimedBy === owner) {
-        isolated = true
-        networkList.push(isolatedNetwork)
-      } else {
-        logger.error(`${container.Names} wants isolated network "${isolatedNetwork}", but it ${claimedBy ? `belongs to ${claimedBy}` : "was not created by Dragonify"}; not connecting. Pick a unique traefik.docker.network name.`)
-      }
+  // A private network shared with the reverse proxy, named by the container's
+  // REV_PROXY_NETWORK_LABEL (e.g. traefik.docker.network, which also tells Traefik
+  // to route over it).
+  const revProxyNetwork = getRevProxyNetwork(container)
+  if (revProxyNetwork) {
+    const owner = `${container.Labels["com.docker.compose.project"]}/${container.Labels["com.docker.compose.service"]}`
+    await ensureNetwork(docker, revProxyNetwork, { [REV_PROXY_NETWORK_OWNER_LABEL]: owner })
+    const claimedBy = (await docker.getNetwork(revProxyNetwork).inspect()).Labels?.[REV_PROXY_NETWORK_OWNER_LABEL]
+    if (claimedBy !== owner) {
+      logger.warn(`${container.Names} is joining reverse proxy network "${revProxyNetwork}", which ${claimedBy ? `${claimedBy} also uses` : "Dragonify did not create"}; they can reach each other's ports`)
     }
+    networkList.push(revProxyNetwork)
   }
 
   for (const network_name of networkList) {
@@ -183,29 +184,29 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
     await connectContainerToAppsNetwork(docker, container, network_name)
   }
 
-  if (isolated) {
-    await connectTraefik(docker, isolatedNetwork)
+  if (revProxyNetwork) {
+    await connectRevProxy(docker, revProxyNetwork)
   }
 
   logger.info(`${container.Names} is connected to all its networks`)
 }
 
-async function connectTraefik(docker: Docker, network_name: string) {
-  let traefik
+async function connectRevProxy(docker: Docker, network_name: string) {
+  let revProxy
   try {
-    traefik = await docker.getContainer(TRAEFIK_CONTAINER).inspect()
+    revProxy = await docker.getContainer(REV_PROXY_CONTAINER!).inspect()
   } catch (e: any) {
     if (e.statusCode !== 404) throw e
-    logger.warn(`Traefik container "${TRAEFIK_CONTAINER}" not found, will connect it to "${network_name}" when it starts`)
+    logger.warn(`Reverse proxy container "${REV_PROXY_CONTAINER}" not found, will connect it to "${network_name}" when it starts`)
     return
   }
-  if (traefik.NetworkSettings.Networks[network_name]) return
+  if (revProxy.NetworkSettings.Networks[network_name]) return
 
   try {
-    await docker.getNetwork(network_name).connect({ Container: traefik.Id })
-    logger.info(`Traefik container "${TRAEFIK_CONTAINER}" connected to network "${network_name}"`)
+    await docker.getNetwork(network_name).connect({ Container: revProxy.Id })
+    logger.info(`Reverse proxy container "${REV_PROXY_CONTAINER}" connected to network "${network_name}"`)
   } catch (e: any) {
-    logger.error(`Failed to connect Traefik container "${TRAEFIK_CONTAINER}" to network "${network_name}":`, e)
+    logger.error(`Failed to connect reverse proxy container "${REV_PROXY_CONTAINER}" to network "${network_name}":`, e)
   }
 }
 
@@ -249,15 +250,15 @@ async function removeEmptyCreatedNetwork(docker: Docker) {
   for (const networkSummary of dragonifyNetworks) {
     const network = await docker.getNetwork(networkSummary.Id).inspect()
     const containers = network.Containers ?? {}
-    // An isolated network counts as empty once only Traefik is left on it.
-    const traefikIds = network.Labels[ISOLATED_LABEL]
-      ? Object.keys(containers).filter(id => containers[id].Name === TRAEFIK_CONTAINER)
+    // A reverse proxy network counts as empty once only the reverse proxy is left on it.
+    const revProxyIds = network.Labels[REV_PROXY_NETWORK_OWNER_LABEL]
+      ? Object.keys(containers).filter(id => containers[id].Name === REV_PROXY_CONTAINER)
       : []
-    const isEmpty = Object.keys(containers).length === traefikIds.length
+    const isEmpty = Object.keys(containers).length === revProxyIds.length
     
     if (isEmpty) {
       logger.info(`Network "${network.Name}" is now empty and will be deleted.`)
-      for (const id of traefikIds) {
+      for (const id of revProxyIds) {
         await docker.getNetwork(network.Id).disconnect({ Container: id })
       }
       await docker.getNetwork(network.Id).remove()
@@ -277,8 +278,8 @@ async function main() {
   const events = getEventStream(docker)
   events.on("container.start", (event) => {
     const containerAttributes = event.Actor.Attributes
-    // A recreated Traefik container has lost its isolated networks.
-    if (containerAttributes["name"] === TRAEFIK_CONTAINER) {
+    // A recreated reverse proxy container has lost its reverse proxy networks.
+    if (REV_PROXY_NETWORKS && containerAttributes["name"] === REV_PROXY_CONTAINER) {
       connectAllContainersToAppsNetwork(docker)
       return
     }
@@ -290,7 +291,7 @@ async function main() {
   })
 
   // Several containers stop at once on compose down; run cleanups one at a
-  // time so two don't race to disconnect Traefik from the same network.
+  // time so two don't race to disconnect the reverse proxy from the same network.
   let cleanup = Promise.resolve()
   events.on("container.stop", (event) => {
     const containerAttributes = event.Actor.Attributes

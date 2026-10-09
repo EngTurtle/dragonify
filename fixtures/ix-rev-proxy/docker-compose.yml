@@ -1,0 +1,26 @@
+# Run Dragonify with REV_PROXY_NETWORKS=true, REV_PROXY_NETWORK_LABEL=traefik.docker.network,
+# REV_PROXY_NETWORK_MATCH=^traefik- and REV_PROXY_CONTAINER=traefik, and a container named "traefik" on
+# any bridge network, e.g. `docker run -d --name traefik alpine sleep infinity`,
+# then `docker compose -p ix-rev-proxy up -d`.
+services:
+  web:
+    # Own network, shared only with Traefik.
+    image: nginx:alpine
+    labels:
+      traefik.docker.network: traefik-test-web
+  web2:
+    # Same stack as web, but its own network.
+    image: nginx:alpine
+    labels:
+      traefik.docker.network: traefik-test-web2
+  sharer:
+    # Names web's network: connected, with a warning.
+    image: nginx:alpine
+    depends_on: [web]
+    labels:
+      traefik.docker.network: traefik-test-web
+  nomatch:
+    # Doesn't match REV_PROXY_NETWORK_MATCH: no network created.
+    image: nginx:alpine
+    labels:
+      traefik.docker.network: shared-test-net
