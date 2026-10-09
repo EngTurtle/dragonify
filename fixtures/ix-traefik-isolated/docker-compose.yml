@@ -1,0 +1,14 @@
+# Run a container named "traefik" first, e.g.
+#   docker run -d --name traefik --network none alpine sleep infinity
+# then `docker compose -p ix-traefik-isolated up -d`. "web" should end up on
+# its own network with only Traefik; "other" should not be able to reach it.
+services:
+  web:
+    image: nginx:alpine
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ix-traefik-isolated-web
+      tj.horner.dragonify.traefik-isolated: "true"
+  other:
+    image: alpine
+    command: sleep infinity

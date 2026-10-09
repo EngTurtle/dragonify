@@ -5,6 +5,8 @@ import { logger } from "./logger"
 const NETWORK_NAME = "apps-internal"
 const CONNECT_ALL_ENABLE: string | undefined = process.env.CONNECT_ALL
 const CUSTOM_NETWORK_NAMES: string | undefined = process.env.CUSTOMS_NETWORKS
+const TRAEFIK_CONTAINER = process.env.TRAEFIK_CONTAINER ?? "traefik"
+const ISOLATED_LABEL = "tj.horner.dragonify.traefik-isolated"
 
 
 if (CONNECT_ALL_ENABLE !== undefined) {
@@ -53,26 +55,30 @@ async function setUpNetwork(docker: Docker) {
   for (let i = 0; i < networkList.length; i++) {
     logger.info(`Setting up network "${networkList[i]}"`)
 
-    const existingNetworks = await docker.listNetworks({filters: {name: [networkList[i]]}})
-    if (existingNetworks.find(n => n.Name === networkList[i])) {
-      logger.info(`Network "${networkList[i]}" already exists`)
-    }
-    else {
-      try {
-        await docker.createNetwork({
-          Name: networkList[i],
-          Driver: "bridge",
-          Internal: true,
-          Labels: {
-            "tj.horner.dragonify.networks": "true"
-          },
-        })
-        logger.info(`Network "${networkList[i]}" created`)
-      } catch (e: any) {
-        if (e.statusCode !== 409) throw e
-        logger.debug(`Network "${networkList[i]}" already exists (race condition)`)
-      }
-    }
+    await ensureNetwork(docker, networkList[i])
+  }
+}
+
+async function ensureNetwork(docker: Docker, network_name: string, extraLabels: Record<string, string> = {}) {
+  const existingNetworks = await docker.listNetworks({filters: {name: [network_name]}})
+  if (existingNetworks.find(n => n.Name === network_name)) {
+    logger.debug(`Network "${network_name}" already exists`)
+    return
+  }
+  try {
+    await docker.createNetwork({
+      Name: network_name,
+      Driver: "bridge",
+      Internal: true,
+      Labels: {
+        "tj.horner.dragonify.networks": "true",
+        ...extraLabels
+      },
+    })
+    logger.info(`Network "${network_name}" created`)
+  } catch (e: any) {
+    if (e.statusCode !== 409) throw e
+    logger.debug(`Network "${network_name}" already exists (race condition)`)
   }
 }
 
@@ -94,24 +100,7 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
     return
   }
 
-  const isExistingNetwork = await docker.listNetworks({filters: {name: [network_name]}})
-  if (!isExistingNetwork.find(n => n.Name === network_name)) {
-    logger.info(`Network "${network_name}" need by ${container.Names} don't exists yet, creating...`)
-    try {
-      await docker.createNetwork({
-        Name: network_name,
-        Driver: "bridge",
-        Internal: true,
-        Labels: {
-          "tj.horner.dragonify.networks": "true"
-        },
-      })
-      logger.info(`Network "${network_name}" created`)
-    } catch (e: any) {
-      if (e.statusCode !== 409) throw e
-      logger.debug(`Network "${network_name}" already exists (race condition)`)
-    }
-  }
+  await ensureNetwork(docker, network_name)
 
   const network = docker.getNetwork(network_name)
   const dnsName = getDnsName(container)
@@ -149,6 +138,67 @@ function isNetworkSpecified(container: Docker.ContainerInfo) {
   return container.Labels["tj.horner.dragonify.networks"] !== undefined
 }
 
+function isTraefikIsolated(container: Docker.ContainerInfo) {
+  return container.Labels[ISOLATED_LABEL] === "true" && container.Labels["traefik.enable"] === "true"
+}
+
+async function connectContainer(docker: Docker, container: Docker.ContainerInfo) {
+  const networkList:string[] = []
+  if (CONNECT_ALL !== "false" ) {
+    logger.info(`${container.Names} will be connected to all others`)
+    networkList.push(NETWORK_NAME)
+  }
+  if (isNetworkSpecified(container)) {
+    networkList.push(...container.Labels["tj.horner.dragonify.networks"].split(','))
+  }
+
+  // Traefik picks the network named by traefik.docker.network, so that label
+  // also names the private network shared by this container and Traefik.
+  const isolatedNetwork = container.Labels["traefik.docker.network"]
+  if (isTraefikIsolated(container)) {
+    if (isolatedNetwork) {
+      await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: "true" })
+      networkList.push(isolatedNetwork)
+    } else {
+      logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but no traefik.docker.network label, skipping isolated network`)
+    }
+  }
+
+  for (const network_name of networkList) {
+    if (isContainerInNetwork(container, network_name)) {
+      logger.debug(`Container ${container.Id} already connected to network "${network_name}"`)
+      continue
+    }
+    logger.info(`Connecting ${container.Names} to "${network_name}"`)
+    await connectContainerToAppsNetwork(docker, container, network_name)
+  }
+
+  if (isTraefikIsolated(container) && isolatedNetwork) {
+    await connectTraefik(docker, isolatedNetwork)
+  }
+
+  logger.info(`${container.Names} is connected to all its networks`)
+}
+
+async function connectTraefik(docker: Docker, network_name: string) {
+  let traefik
+  try {
+    traefik = await docker.getContainer(TRAEFIK_CONTAINER).inspect()
+  } catch (e: any) {
+    if (e.statusCode !== 404) throw e
+    logger.warn(`Traefik container "${TRAEFIK_CONTAINER}" not found, will connect it to "${network_name}" when it starts`)
+    return
+  }
+  if (traefik.NetworkSettings.Networks[network_name]) return
+
+  try {
+    await docker.getNetwork(network_name).connect({ Container: traefik.Id })
+    logger.info(`Traefik container "${TRAEFIK_CONTAINER}" connected to network "${network_name}"`)
+  } catch (e: any) {
+    logger.error(`Failed to connect Traefik container "${TRAEFIK_CONTAINER}" to network "${network_name}":`, e)
+  }
+}
+
 async function connectAllContainersToAppsNetwork(docker: Docker) {
   logger.debug("Connecting existing app containers to network")
 
@@ -159,32 +209,8 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
     }
   })
 
-  const appContainers = containers.filter(isIxAppContainer)
-  for (const container of appContainers) {
-    const networkList:string[] = []
-    if (CONNECT_ALL !== "false" ) {
-      logger.info(`${container.Names} will be connected to all others`)
-      networkList.push(NETWORK_NAME)
-    }
-    if (isNetworkSpecified(container)) {
-      const individualNetworks: string[] = container.Labels["tj.horner.dragonify.networks"].split(',')
-
-      for (let i = 0; i < individualNetworks.length; i++) {
-        networkList.push(individualNetworks[i])
-      }
-    }
-
-    for (let i = 0; i < networkList.length; i++) {
-      if (isContainerInNetwork(container, networkList[i])) {
-        logger.debug(`Container ${container.Id} already connected to network "${networkList[i]}"`)
-        continue
-      }
-      logger.info(`Connecting ${container.Names} to "${networkList[i]}"`)
-      await connectContainerToAppsNetwork(docker, container, networkList[i])
-    }
-
-    logger.info(`${container.Names} is connected to all its networks`)
-    
+  for (const container of containers.filter(isIxAppContainer)) {
+    await connectContainer(docker, container)
   }
 
   logger.info("All configured app containers connected to their network")
@@ -203,31 +229,7 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
   }
 
   logger.debug(`New container started: ${container.Id}`)
-
-  const networkList:string[] = []
-  if (CONNECT_ALL !== "false" ) {
-    logger.info(`${container.Names} will be connected to all others`)
-    networkList.push(NETWORK_NAME)
-  }
-  if (isNetworkSpecified(container)) {
-    const individualNetworks: string[] = container.Labels["tj.horner.dragonify.networks"].split(',')
-
-    for (let i = 0; i < individualNetworks.length; i++) {
-      networkList.push(individualNetworks[i])
-    }
-  }
-
-  for (let i = 0; i < networkList.length; i++) {
-    if (isContainerInNetwork(container, networkList[i])) {
-      logger.debug(`Container ${container.Id} already connected to network "${networkList[i]}"`)
-      return
-    }
-
-    logger.info(`Connecting ${container.Names} to "${networkList[i]}"`)
-    await connectContainerToAppsNetwork(docker, container, networkList[i])
-  }
-
-  logger.info(`${container.Names} is connected to all its networks`)
+  await connectContainer(docker, container)
 }
 
 async function removeEmptyCreatedNetwork(docker: Docker) {
@@ -237,10 +239,17 @@ async function removeEmptyCreatedNetwork(docker: Docker) {
   for (const networkSummary of dragonifyNetworks) {
     const network = await docker.getNetwork(networkSummary.Id).inspect()
     const containers = network.Containers ?? {}
-    const isEmpty = Object.keys(containers).length === 0
+    // An isolated network counts as empty once only Traefik is left on it.
+    const traefikIds = network.Labels[ISOLATED_LABEL] === "true"
+      ? Object.keys(containers).filter(id => containers[id].Name === TRAEFIK_CONTAINER)
+      : []
+    const isEmpty = Object.keys(containers).length === traefikIds.length
     
     if (isEmpty) {
       logger.info(`Network "${network.Name}" is now empty and will be deleted.`)
+      for (const id of traefikIds) {
+        await docker.getNetwork(network.Id).disconnect({ Container: id })
+      }
       await docker.getNetwork(network.Id).remove()
     }
     else {
@@ -258,6 +267,11 @@ async function main() {
   const events = getEventStream(docker)
   events.on("container.start", (event) => {
     const containerAttributes = event.Actor.Attributes
+    // A recreated Traefik container has lost its isolated networks.
+    if (containerAttributes["name"] === TRAEFIK_CONTAINER) {
+      connectAllContainersToAppsNetwork(docker)
+      return
+    }
     if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
       return
     }

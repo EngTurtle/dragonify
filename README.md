@@ -34,6 +34,7 @@ Here's the environment variables section as a table:
 |----------|-------------|--------|---------|
 | `LOG_LEVEL` | Sets the verbosity of the application's logs. | `info` (default), `debug` | `LOG_LEVEL: debug` |
 | `CONNECT_ALL` | Controls whether all TrueNAS-managed `ix-` apps should be automatically connected to the default `apps-internal` network. | `true` (default), `false` | `CONNECT_ALL: "false"` |
+| `TRAEFIK_CONTAINER` | Name of the Traefik container that `tj.horner.dragonify.traefik-isolated` networks are shared with. | `traefik` (default) | `TRAEFIK_CONTAINER: my-traefik` |
 | `CUSTOMS_NETWORKS` | A comma-separated list of Docker networks that Dragonify should create on startup. This is useful for pre-defining networks you plan to use across multiple applications. | e.g. `media-net,home-automation-net` | `CUSTOMS_NETWORKS: apps-internal-custom,app-external` |
 
 #### Container Label
@@ -50,3 +51,14 @@ To connect an application container to one or more specific networks, you use a 
     - "tj.horner.dragonify.networks=media-net,downloads"
 ```
 ![label example](label-example.png)
+
+- `tj.horner.dragonify.traefik-isolated`
+    - **Description**: Gives the container a private network shared only with Traefik, so proxied apps can't reach each other's ports the way they can on one shared Traefik network. Requires `traefik.enable=true` and `traefik.docker.network=<name>`: Dragonify creates the network named by `traefik.docker.network` and connects both the container and Traefik to it. The same label tells Traefik which network to use, overriding `providers.docker.network`. The network is removed when the app stops, and Traefik is reconnected to every isolated network when its container is recreated.
+    - **Example**:
+
+```yaml
+  labels:
+    - "traefik.enable=true"
+    - "traefik.docker.network=traefik-jellyfin"
+    - "tj.horner.dragonify.traefik-isolated=true"
+```
