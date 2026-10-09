@@ -152,16 +152,17 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
     networkList.push(...container.Labels["tj.horner.dragonify.networks"].split(','))
   }
 
-  // Traefik picks the network named by traefik.docker.network, so that label
-  // also names the private network shared by this container and Traefik.
-  const isolatedNetwork = container.Labels["traefik.docker.network"]
-  if (isTraefikIsolated(container)) {
-    if (isolatedNetwork) {
-      await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: "true" })
-      networkList.push(isolatedNetwork)
-    } else {
-      logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but no traefik.docker.network label, skipping isolated network`)
-    }
+  // Named after the compose project, which Docker keeps unique, so two apps
+  // can't end up sharing one. traefik.docker.network must match it so Traefik
+  // routes over this network.
+  const isolatedNetwork = `traefik-${container.Labels["com.docker.compose.project"]}`
+  const isolated = isTraefikIsolated(container) && container.Labels["traefik.docker.network"] === isolatedNetwork
+  if (isTraefikIsolated(container) && !isolated) {
+    logger.warn(`${container.Names} has ${ISOLATED_LABEL}=true but needs traefik.docker.network=${isolatedNetwork}, skipping isolated network`)
+  }
+  if (isolated) {
+    await ensureNetwork(docker, isolatedNetwork, { [ISOLATED_LABEL]: "true" })
+    networkList.push(isolatedNetwork)
   }
 
   for (const network_name of networkList) {
@@ -173,7 +174,7 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
     await connectContainerToAppsNetwork(docker, container, network_name)
   }
 
-  if (isTraefikIsolated(container) && isolatedNetwork) {
+  if (isolated) {
     await connectTraefik(docker, isolatedNetwork)
   }
 

@@ -7,7 +7,14 @@ services:
     image: nginx:alpine
     labels:
       traefik.enable: "true"
-      traefik.docker.network: ix-traefik-isolated-web
+      traefik.docker.network: traefik-ix-traefik-isolated
+      tj.horner.dragonify.traefik-isolated: "true"
+  wrong-name:
+    # Should log a warning and get no isolated network.
+    image: nginx:alpine
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-ix-someone-else
       tj.horner.dragonify.traefik-isolated: "true"
   other:
     image: alpine

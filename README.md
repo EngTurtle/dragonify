@@ -53,12 +53,12 @@ To connect an application container to one or more specific networks, you use a 
 ![label example](label-example.png)
 
 - `tj.horner.dragonify.traefik-isolated`
-    - **Description**: Gives the container a private network shared only with Traefik, so proxied apps can't reach each other's ports the way they can on one shared Traefik network. Requires `traefik.enable=true` and `traefik.docker.network=<name>`: Dragonify creates the network named by `traefik.docker.network` and connects both the container and Traefik to it. The same label tells Traefik which network to use, overriding `providers.docker.network`. The network is removed when the app stops, and Traefik is reconnected to every isolated network when its container is recreated.
+    - **Description**: Gives the container a private network shared only with Traefik, so proxied apps can't reach each other's ports the way they can on one shared Traefik network. Dragonify names the network `traefik-<compose project>` (for a TrueNAS app called `jellyfin`, `traefik-ix-jellyfin`), so two apps can never share one. The container also needs `traefik.enable=true` and `traefik.docker.network` set to that name, which tells Traefik to route over it instead of `providers.docker.network`; if it doesn't match, Dragonify logs a warning and skips the container. The network is removed when the app stops, and Traefik is reconnected to every isolated network when its container is recreated.
     - **Example**:
 
 ```yaml
   labels:
     - "traefik.enable=true"
-    - "traefik.docker.network=traefik-jellyfin"
+    - "traefik.docker.network=traefik-ix-jellyfin"
     - "tj.horner.dragonify.traefik-isolated=true"
 ```
