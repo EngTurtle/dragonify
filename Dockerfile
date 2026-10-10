@@ -1,10 +1,10 @@
-FROM node:24-slim AS build
+FROM node:24-trixie-slim AS build
 COPY . /app
 WORKDIR /app
 RUN npm ci
 RUN npm run build
 
-FROM node:24-slim AS prod-deps
+FROM node:24-trixie-slim AS prod-deps
 COPY package*.json /app/
 WORKDIR /app
 RUN npm ci --omit=dev

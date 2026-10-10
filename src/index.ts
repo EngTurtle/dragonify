@@ -221,7 +221,11 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
   })
 
   for (const container of containers.filter(isIxAppContainer)) {
-    await connectContainer(docker, container)
+    try {
+      await connectContainer(docker, container)
+    } catch (e: any) {
+      logger.error(`Failed to connect ${container.Names} to its networks:`, e)
+    }
   }
 
   logger.info("All configured app containers connected to their network")
@@ -273,35 +277,39 @@ async function main() {
   const docker = new Docker()
 
   await setUpNetwork(docker)
-  await connectAllContainersToAppsNetwork(docker)
+
+  // Startup, start and stop handling run one at a time through this queue, so
+  // cleanup after one container stops can't delete a network that a starting
+  // container is about to join (compose does both at once on a redeploy).
+  let queue = Promise.resolve()
+  const enqueue = (task: string, work: () => Promise<unknown>) => {
+    queue = queue.then(work).then(() => {}, e => { logger.error(`${task} failed:`, e) })
+  }
 
   const events = getEventStream(docker)
+  enqueue("Connecting existing containers", () => connectAllContainersToAppsNetwork(docker))
+
   events.on("container.start", (event) => {
     const containerAttributes = event.Actor.Attributes
     // A recreated reverse proxy container has lost its reverse proxy networks.
     if (REV_PROXY_NETWORKS && containerAttributes["name"] === REV_PROXY_CONTAINER) {
-      connectAllContainersToAppsNetwork(docker)
+      enqueue("Reconnecting reverse proxy", () => connectAllContainersToAppsNetwork(docker))
       return
     }
     if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    connectNewContainerToAppsNetwork(docker, event.Actor["ID"])
+    enqueue(`Connecting ${containerAttributes["name"]}`, () => connectNewContainerToAppsNetwork(docker, event.Actor["ID"]))
   })
 
-  // Several containers stop at once on compose down; run cleanups one at a
-  // time so two don't race to disconnect the reverse proxy from the same network.
-  let cleanup = Promise.resolve()
   events.on("container.stop", (event) => {
     const containerAttributes = event.Actor.Attributes
     if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    cleanup = cleanup
-      .then(() => removeEmptyCreatedNetwork(docker))
-      .catch(e => { logger.error("Network cleanup failed:", e) })
+    enqueue("Network cleanup", () => removeEmptyCreatedNetwork(docker))
   })
 }
 
