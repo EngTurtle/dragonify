@@ -5,6 +5,8 @@ import { logger } from "./logger"
 const NETWORK_NAME = "apps-internal"
 const CONNECT_ALL = (process.env.CONNECT_ALL ?? "false").toLowerCase()
 const CUSTOM_NETWORKS = process.env.CUSTOMS_NETWORKS?.split(",") ?? []
+// Created at startup for containers to join later, so never cleaned up.
+const STARTUP_NETWORKS = CONNECT_ALL !== "false" ? [NETWORK_NAME, ...CUSTOM_NETWORKS] : CUSTOM_NETWORKS
 const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
 const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
 const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "") : undefined
@@ -17,10 +19,8 @@ if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
 const REV_PROXY_NETWORK_OWNER_LABEL = "tj.horner.dragonify.rev-proxy-network"
 
 async function setUpNetwork(docker: Docker) {
-  const networkList:string[] = []
   if (CONNECT_ALL !== "false" ) {
     logger.info(`"${NETWORK_NAME}" will be created for connect all your containers`)
-    networkList.push(NETWORK_NAME)
   }
   else {
     const existingNetworks = await docker.listNetworks()
@@ -31,7 +31,7 @@ async function setUpNetwork(docker: Docker) {
     }
   }
 
-  for (const network_name of [...networkList, ...CUSTOM_NETWORKS]) {
+  for (const network_name of STARTUP_NETWORKS) {
     logger.info(`Setting up network "${network_name}"`)
     await ensureNetwork(docker, network_name)
   }
@@ -236,7 +236,7 @@ async function removeNetwork(docker: Docker, networkId: string) {
 async function removeUnusedNetworks(docker: Docker) {
   const dragonifyNetworks = await docker.listNetworks({ filters: { label: [ "tj.horner.dragonify.networks" ] } })
 
-  for (const network of dragonifyNetworks) {
+  for (const network of dragonifyNetworks.filter(n => !STARTUP_NETWORKS.includes(n.Name))) {
     try {
       const users = await docker.listContainers({ all: true, filters: { network: [ network.Id ] } })
       // A reverse proxy network is unused once only the reverse proxy references it.
