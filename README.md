@@ -6,7 +6,7 @@
 Dragonify is a utility for TrueNAS SCALE apps that manages Docker networks for you. It does two jobs:
 
 - **Inter-app networking:** it puts apps on shared networks and gives each one a DNS name, so apps can reach each other the way they could in earlier TrueNAS versions.
-- **Reverse proxy isolation:** it gives each app behind a reverse proxy such as Traefik a private network shared only with the proxy, so proxied apps can't reach each other's ports. Docker and TrueNAS have no built-in way to do this; see [Reverse proxy networks](#reverse-proxy-networks).
+- **Reverse proxy isolation:** it gives each app behind a reverse proxy such as Traefik a private network shared only with the proxy, so proxied apps can't reach each other's ports, even for TrueNAS catalog apps whose compose files you can't edit. See [Reverse proxy networks](#reverse-proxy-networks).
 
 > [!Warning]
 >
@@ -79,3 +79,5 @@ Point `REV_PROXY_NETWORK_LABEL` at the label your proxy already reads to pick a 
 - A label value naming a network Dragonify didn't create, such as an existing shared network, is joined with a warning and never deleted. Set `REV_PROXY_NETWORK_MATCH` so such values don't match.
 - The network is removed once the app's containers are removed (for example when the app is deleted or redeployed). A stopped app keeps its network so it can start again. The reverse proxy is reconnected to every reverse proxy network when its container is recreated.
 - Services in the same app can still reach each other over the app's own default network unless its compose file separates them.
+
+Related tools: [traefik_network_connector](https://github.com/obeone/traefik_network_connector) connects Traefik to networks your compose files already define, and [trafficjam](https://github.com/kaysond/trafficjam) isolates apps on one shared network with firewall rules. Dragonify instead creates and removes each app's network itself, which suits apps whose compose files you can't add networks to.
