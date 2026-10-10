@@ -2,77 +2,71 @@ import Docker from "dockerode"
 import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
+function envRegex(name: string, fallback: string) {
+  try {
+    return new RegExp(process.env[name] ?? fallback)
+  } catch (e: any) {
+    throw new Error(`${name} is not a valid regex: ${e.message}`)
+  }
+}
+
 const NETWORK_NAME = "apps-internal"
-const CONNECT_ALL_ENABLE: string | undefined = process.env.CONNECT_ALL
-const CUSTOM_NETWORK_NAMES: string | undefined = process.env.CUSTOMS_NETWORKS
-
-
-if (CONNECT_ALL_ENABLE !== undefined) {
-  var CONNECT_ALL: string | undefined = CONNECT_ALL_ENABLE.toLowerCase( )
+// Compose projects Dragonify manages; TrueNAS names its apps' projects ix-*.
+const PROJECT_MATCH = envRegex("PROJECT_MATCH", "^ix-")
+const CONNECT_ALL = (process.env.CONNECT_ALL ?? "false").toLowerCase()
+const CUSTOM_NETWORKS = process.env.CUSTOMS_NETWORKS?.split(",") ?? []
+// Created at startup for containers to join later, so never cleaned up.
+const STARTUP_NETWORKS = CONNECT_ALL !== "false" ? [NETWORK_NAME, ...CUSTOM_NETWORKS] : CUSTOM_NETWORKS
+const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
+const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
+const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? envRegex("REV_PROXY_NETWORK_MATCH", "") : undefined
+const REV_PROXY_CONTAINER = process.env.REV_PROXY_CONTAINER
+if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
+  throw new Error("REV_PROXY_NETWORKS=true needs REV_PROXY_NETWORK_LABEL and REV_PROXY_CONTAINER")
 }
-else {
-  var CONNECT_ALL: string | undefined = "false"
-}
-var networks_liste: string[] = [NETWORK_NAME]
-if (CUSTOM_NETWORK_NAMES !== undefined) {
-  var networks_liste: string[] = CUSTOM_NETWORK_NAMES.split(',')
-}
-else {
-  var networks_liste: string[] = []
-}
+// Set on networks Dragonify creates for the reverse proxy; the value is the
+// project/service that first asked for the network.
+const REV_PROXY_NETWORK_OWNER_LABEL = "tj.horner.dragonify.rev-proxy-network"
 
 async function setUpNetwork(docker: Docker) {
-  const networkList:string[] = []
   if (CONNECT_ALL !== "false" ) {
     logger.info(`"${NETWORK_NAME}" will be created for connect all your containers`)
-    networkList.push(NETWORK_NAME)
   }
   else {
     const existingNetworks = await docker.listNetworks()
     const NETWORK_NAME_exist = existingNetworks.find((thisnetwork: any) => thisnetwork.Name === NETWORK_NAME)
     if (NETWORK_NAME_exist) {
       logger.info(`Network "${NETWORK_NAME}" is present but CONNECT_ALL set to "False". This network will be remove.`)
-      const network = await docker.getNetwork(NETWORK_NAME_exist.Id).inspect()
-      const containers = network.Containers ?? {}
-
-      for (const containerID of Object.keys(containers)) {
-        await docker.getNetwork(network.Id).disconnect({ Container: containerID })
-        logger.debug(`Container "${containerID}" is now disconnected from "${network.Name}".`)
-      }
-
-      logger.debug(`Network "${network.Name}" is now empty and will be deleted.`)
-      await docker.getNetwork(network.Id).remove()
-
+      await removeNetwork(docker, NETWORK_NAME_exist.Id)
     }
   }
 
-  for (let i = 0; i < networks_liste.length; i++) {
-    networkList.push(networks_liste[i])
+  for (const network_name of STARTUP_NETWORKS) {
+    logger.info(`Setting up network "${network_name}"`)
+    await ensureNetwork(docker, network_name)
   }
+}
 
-  for (let i = 0; i < networkList.length; i++) {
-    logger.info(`Setting up network "${networkList[i]}"`)
-
-    const existingNetworks = await docker.listNetworks({filters: {name: [networkList[i]]}})
-    if (existingNetworks.find(n => n.Name === networkList[i])) {
-      logger.info(`Network "${networkList[i]}" already exists`)
-    }
-    else {
-      try {
-        await docker.createNetwork({
-          Name: networkList[i],
-          Driver: "bridge",
-          Internal: true,
-          Labels: {
-            "tj.horner.dragonify.networks": "true"
-          },
-        })
-        logger.info(`Network "${networkList[i]}" created`)
-      } catch (e: any) {
-        if (e.statusCode !== 409) throw e
-        logger.debug(`Network "${networkList[i]}" already exists (race condition)`)
-      }
-    }
+async function ensureNetwork(docker: Docker, network_name: string, extraLabels: Record<string, string> = {}) {
+  const existingNetworks = await docker.listNetworks({filters: {name: [network_name]}})
+  if (existingNetworks.find(n => n.Name === network_name)) {
+    logger.debug(`Network "${network_name}" already exists`)
+    return
+  }
+  try {
+    await docker.createNetwork({
+      Name: network_name,
+      Driver: "bridge",
+      Internal: true,
+      Labels: {
+        "tj.horner.dragonify.networks": "true",
+        ...extraLabels
+      },
+    })
+    logger.info(`Network "${network_name}" created`)
+  } catch (e: any) {
+    if (e.statusCode !== 409) throw e
+    logger.debug(`Network "${network_name}" already exists (race condition)`)
   }
 }
 
@@ -88,30 +82,13 @@ function prohibitedNetworkMode(networkMode: string) {
     networkMode.startsWith("service:")
 }
 
-async function connectContainerToAppsNetwork(docker: Docker, container: Docker.ContainerInfo, network_name: string) {
+async function connectToNetwork(docker: Docker, container: Docker.ContainerInfo, network_name: string) {
   if (prohibitedNetworkMode(container.HostConfig.NetworkMode)) {
     logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`)
     return
   }
 
-  const isExistingNetwork = await docker.listNetworks({filters: {name: [network_name]}})
-  if (!isExistingNetwork.find(n => n.Name === network_name)) {
-    logger.info(`Network "${network_name}" need by ${container.Names} don't exists yet, creating...`)
-    try {
-      await docker.createNetwork({
-        Name: network_name,
-        Driver: "bridge",
-        Internal: true,
-        Labels: {
-          "tj.horner.dragonify.networks": "true"
-        },
-      })
-      logger.info(`Network "${network_name}" created`)
-    } catch (e: any) {
-      if (e.statusCode !== 409) throw e
-      logger.debug(`Network "${network_name}" already exists (race condition)`)
-    }
-  }
+  await ensureNetwork(docker, network_name)
 
   const network = docker.getNetwork(network_name)
   const dnsName = getDnsName(container)
@@ -137,16 +114,82 @@ function isContainerInNetwork(container: Docker.ContainerInfo, network_name: str
   return container.NetworkSettings.Networks[network_name] !== undefined
 }
 
-function isIxProjectName(name: string) {
-  return name?.startsWith("ix-") ?? false
+function isManagedProject(name: string | undefined) {
+  return name !== undefined && PROJECT_MATCH.test(name)
 }
 
-function isIxAppContainer(container: Docker.ContainerInfo) {
-  return isIxProjectName(container.Labels["com.docker.compose.project"])
+function isManagedContainer(container: Docker.ContainerInfo) {
+  return isManagedProject(container.Labels["com.docker.compose.project"])
 }
 
 function isNetworkSpecified(container: Docker.ContainerInfo) {
   return container.Labels["tj.horner.dragonify.networks"] !== undefined
+}
+
+function getRevProxyNetwork(container: Docker.ContainerInfo) {
+  const name = container.Labels[REV_PROXY_NETWORK_LABEL!]
+  // A container sharing another's network stack (or none/host) can't join it.
+  return REV_PROXY_NETWORKS && name && REV_PROXY_NETWORK_MATCH!.test(name) &&
+    !prohibitedNetworkMode(container.HostConfig.NetworkMode) ? name : undefined
+}
+
+async function connectToAllNetworks(docker: Docker, container: Docker.ContainerInfo) {
+  const networkList:string[] = []
+  if (CONNECT_ALL !== "false" ) {
+    logger.info(`${container.Names} will be connected to all others`)
+    networkList.push(NETWORK_NAME)
+  }
+  if (isNetworkSpecified(container)) {
+    networkList.push(...container.Labels["tj.horner.dragonify.networks"].split(','))
+  }
+
+  // A private network shared with the reverse proxy, named by the container's
+  // REV_PROXY_NETWORK_LABEL (e.g. traefik.docker.network, which also tells Traefik
+  // to route over it).
+  const revProxyNetwork = getRevProxyNetwork(container)
+  if (revProxyNetwork) {
+    const owner = `${container.Labels["com.docker.compose.project"]}/${container.Labels["com.docker.compose.service"]}`
+    await ensureNetwork(docker, revProxyNetwork, { [REV_PROXY_NETWORK_OWNER_LABEL]: owner })
+    const claimedBy = (await docker.getNetwork(revProxyNetwork).inspect()).Labels?.[REV_PROXY_NETWORK_OWNER_LABEL]
+    if (claimedBy !== owner) {
+      logger.warn(`${container.Names} is joining reverse proxy network "${revProxyNetwork}", which ${claimedBy ? `${claimedBy} also uses` : "Dragonify did not create"}; they can reach each other's ports`)
+    }
+    networkList.push(revProxyNetwork)
+  }
+
+  for (const network_name of networkList) {
+    if (isContainerInNetwork(container, network_name)) {
+      logger.debug(`Container ${container.Id} already connected to network "${network_name}"`)
+      continue
+    }
+    logger.info(`Connecting ${container.Names} to "${network_name}"`)
+    await connectToNetwork(docker, container, network_name)
+  }
+
+  if (revProxyNetwork) {
+    await connectRevProxy(docker, revProxyNetwork)
+  }
+
+  logger.info(`${container.Names} is connected to all its networks`)
+}
+
+async function connectRevProxy(docker: Docker, network_name: string) {
+  let revProxy
+  try {
+    revProxy = await docker.getContainer(REV_PROXY_CONTAINER!).inspect()
+  } catch (e: any) {
+    if (e.statusCode !== 404) throw e
+    logger.warn(`Reverse proxy container "${REV_PROXY_CONTAINER}" not found, will connect it to "${network_name}" when it starts`)
+    return
+  }
+  if (revProxy.NetworkSettings.Networks[network_name]) return
+
+  try {
+    await docker.getNetwork(network_name).connect({ Container: revProxy.Id })
+    logger.info(`Reverse proxy container "${REV_PROXY_CONTAINER}" connected to network "${network_name}"`)
+  } catch (e: any) {
+    logger.error(`Failed to connect reverse proxy container "${REV_PROXY_CONTAINER}" to network "${network_name}":`, e)
+  }
 }
 
 async function connectAllContainersToAppsNetwork(docker: Docker) {
@@ -159,32 +202,12 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
     }
   })
 
-  const appContainers = containers.filter(isIxAppContainer)
-  for (const container of appContainers) {
-    const networkList:string[] = []
-    if (CONNECT_ALL !== "false" ) {
-      logger.info(`${container.Names} will be connected to all others`)
-      networkList.push(NETWORK_NAME)
+  for (const container of containers.filter(isManagedContainer)) {
+    try {
+      await connectToAllNetworks(docker, container)
+    } catch (e: any) {
+      logger.error(`Failed to connect ${container.Names} to its networks:`, e)
     }
-    if (isNetworkSpecified(container)) {
-      const individualNetworks: string[] = container.Labels["tj.horner.dragonify.networks"].split(',')
-
-      for (let i = 0; i < individualNetworks.length; i++) {
-        networkList.push(individualNetworks[i])
-      }
-    }
-
-    for (let i = 0; i < networkList.length; i++) {
-      if (isContainerInNetwork(container, networkList[i])) {
-        logger.debug(`Container ${container.Id} already connected to network "${networkList[i]}"`)
-        continue
-      }
-      logger.info(`Connecting ${container.Names} to "${networkList[i]}"`)
-      await connectContainerToAppsNetwork(docker, container, networkList[i])
-    }
-
-    logger.info(`${container.Names} is connected to all its networks`)
-    
   }
 
   logger.info("All configured app containers connected to their network")
@@ -203,48 +226,39 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
   }
 
   logger.debug(`New container started: ${container.Id}`)
-
-  const networkList:string[] = []
-  if (CONNECT_ALL !== "false" ) {
-    logger.info(`${container.Names} will be connected to all others`)
-    networkList.push(NETWORK_NAME)
-  }
-  if (isNetworkSpecified(container)) {
-    const individualNetworks: string[] = container.Labels["tj.horner.dragonify.networks"].split(',')
-
-    for (let i = 0; i < individualNetworks.length; i++) {
-      networkList.push(individualNetworks[i])
-    }
-  }
-
-  for (let i = 0; i < networkList.length; i++) {
-    if (isContainerInNetwork(container, networkList[i])) {
-      logger.debug(`Container ${container.Id} already connected to network "${networkList[i]}"`)
-      return
-    }
-
-    logger.info(`Connecting ${container.Names} to "${networkList[i]}"`)
-    await connectContainerToAppsNetwork(docker, container, networkList[i])
-  }
-
-  logger.info(`${container.Names} is connected to all its networks`)
+  await connectToAllNetworks(docker, container)
 }
 
-async function removeEmptyCreatedNetwork(docker: Docker) {
-  const existingNetworks = await docker.listNetworks()
-  const dragonifyNetworks = existingNetworks.filter((thisnetwork: any) => thisnetwork.Labels["tj.horner.dragonify.networks"])
+// Disconnects every container still referencing the network, stopped ones
+// included (a stopped container can't start again once its network is gone),
+// then removes the network.
+async function removeNetwork(docker: Docker, networkId: string) {
+  const network = docker.getNetwork(networkId)
+  const users = await docker.listContainers({ all: true, filters: { network: [ networkId ] } })
+  for (const container of users) {
+    await network.disconnect({ Container: container.Id, Force: true })
+  }
+  await network.remove()
+}
 
-  for (const networkSummary of dragonifyNetworks) {
-    const network = await docker.getNetwork(networkSummary.Id).inspect()
-    const containers = network.Containers ?? {}
-    const isEmpty = Object.keys(containers).length === 0
-    
-    if (isEmpty) {
-      logger.info(`Network "${network.Name}" is now empty and will be deleted.`)
-      await docker.getNetwork(network.Id).remove()
-    }
-    else {
-      logger.debug(`Network "${network.Name}" contains containers : ${Object.keys(containers).join(", ")}`)
+// Removes Dragonify's networks that no container references any more. Stopped
+// containers count, so a stopped app keeps its networks until it is removed.
+async function removeUnusedNetworks(docker: Docker) {
+  const dragonifyNetworks = await docker.listNetworks({ filters: { label: [ "tj.horner.dragonify.networks" ] } })
+
+  for (const network of dragonifyNetworks.filter(n => !STARTUP_NETWORKS.includes(n.Name))) {
+    try {
+      const users = await docker.listContainers({ all: true, filters: { network: [ network.Id ] } })
+      // A reverse proxy network is unused once only the reverse proxy references it.
+      const others = users.filter(c => !(network.Labels?.[REV_PROXY_NETWORK_OWNER_LABEL] && c.Names.includes(`/${REV_PROXY_CONTAINER}`)))
+      if (others.length > 0) {
+        logger.debug(`Network "${network.Name}" is used by: ${others.flatMap(c => c.Names).join(", ")}`)
+        continue
+      }
+      logger.info(`Network "${network.Name}" is no longer used and will be deleted.`)
+      await removeNetwork(docker, network.Id)
+    } catch (e: any) {
+      logger.error(`Failed to clean up network "${network.Name}":`, e)
     }
   }
 }
@@ -253,25 +267,42 @@ async function main() {
   const docker = new Docker()
 
   await setUpNetwork(docker)
-  await connectAllContainersToAppsNetwork(docker)
+
+  // Startup, start and removal handling run one at a time through this queue,
+  // so cleanup after one container is removed can't delete a network that a
+  // starting container is about to join (compose does both on a redeploy).
+  let queue = Promise.resolve()
+  const enqueue = (task: string, work: () => Promise<unknown>) => {
+    queue = queue.then(work).then(() => {}, e => { logger.error(`${task} failed:`, e) })
+  }
 
   const events = getEventStream(docker)
+  enqueue("Connecting existing containers", () => connectAllContainersToAppsNetwork(docker))
+  enqueue("Network cleanup", () => removeUnusedNetworks(docker))
+
   events.on("container.start", (event) => {
     const containerAttributes = event.Actor.Attributes
-    if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
+    // A recreated reverse proxy container has lost its reverse proxy networks.
+    if (REV_PROXY_NETWORKS && containerAttributes["name"] === REV_PROXY_CONTAINER) {
+      enqueue("Reconnecting reverse proxy", () => connectAllContainersToAppsNetwork(docker))
+      return
+    }
+    if (!isManagedProject(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    connectNewContainerToAppsNetwork(docker, event.Actor["ID"])
+    enqueue(`Connecting ${containerAttributes["name"]}`, () => connectNewContainerToAppsNetwork(docker, event.Actor["ID"]))
   })
 
-  events.on("container.stop", (event) => {
+  // Cleanup runs when a container is removed, not when it stops: a stopped
+  // container still references its networks and needs them to start again.
+  events.on("container.destroy", (event) => {
     const containerAttributes = event.Actor.Attributes
-    if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
+    if (!isManagedProject(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    removeEmptyCreatedNetwork(docker)
+    enqueue("Network cleanup", () => removeUnusedNetworks(docker))
   })
 }
 
