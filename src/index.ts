@@ -3,6 +3,8 @@ import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
 const NETWORK_NAME = "apps-internal"
+// Compose projects Dragonify manages; TrueNAS names its apps' projects ix-*.
+const PROJECT_MATCH = new RegExp(process.env.PROJECT_MATCH ?? "^ix-")
 const CONNECT_ALL = (process.env.CONNECT_ALL ?? "false").toLowerCase()
 const CUSTOM_NETWORKS = process.env.CUSTOMS_NETWORKS?.split(",") ?? []
 // Created at startup for containers to join later, so never cleaned up.
@@ -104,12 +106,12 @@ function isContainerInNetwork(container: Docker.ContainerInfo, network_name: str
   return container.NetworkSettings.Networks[network_name] !== undefined
 }
 
-function isIxProjectName(name: string) {
-  return name?.startsWith("ix-") ?? false
+function isManagedProject(name: string | undefined) {
+  return name !== undefined && PROJECT_MATCH.test(name)
 }
 
-function isIxAppContainer(container: Docker.ContainerInfo) {
-  return isIxProjectName(container.Labels["com.docker.compose.project"])
+function isManagedContainer(container: Docker.ContainerInfo) {
+  return isManagedProject(container.Labels["com.docker.compose.project"])
 }
 
 function isNetworkSpecified(container: Docker.ContainerInfo) {
@@ -192,7 +194,7 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
     }
   })
 
-  for (const container of containers.filter(isIxAppContainer)) {
+  for (const container of containers.filter(isManagedContainer)) {
     try {
       await connectToAllNetworks(docker, container)
     } catch (e: any) {
@@ -277,7 +279,7 @@ async function main() {
       enqueue("Reconnecting reverse proxy", () => connectAllContainersToAppsNetwork(docker))
       return
     }
-    if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
+    if (!isManagedProject(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
@@ -288,7 +290,7 @@ async function main() {
   // container still references its networks and needs them to start again.
   events.on("container.destroy", (event) => {
     const containerAttributes = event.Actor.Attributes
-    if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
+    if (!isManagedProject(containerAttributes["com.docker.compose.project"])) {
       return
     }
 

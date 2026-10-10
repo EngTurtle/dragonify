@@ -19,7 +19,7 @@ Dragonify listens to Docker events to automatically manage networks and containe
 - It creates and deletes Docker bridge networks. Networks it creates are labelled, and deleted once no container references them (stopped containers count, so a stopped app keeps its networks).
 - When a container is connected to a network, Dragonify assigns it a DNS alias in the format `{service}.{project}.svc.cluster.local`, allowing other containers on the same network to resolve its address by name.
 - You can use environment variables and container labels to customize how Dragonify behaves, from creating multiple isolated networks to controlling which containers get connected.
-- Only works on apps managed by TrueNAS Scale/CE UI, by checking for if the project/stack name in `com.docker.compose.project` property starts with `ix-`.
+- It only manages Docker Compose containers whose project name (the `com.docker.compose.project` label) matches `PROJECT_MATCH`. By default that is `^ix-`, the prefix TrueNAS gives its apps. Set `PROJECT_MATCH: ""` to manage every Compose project, for example on a plain Docker host.
 
 ### Configuration
 
@@ -32,7 +32,8 @@ These variables are set on the `dragonify` container itself.
 | Variable | Description | Values | Example |
 |----------|-------------|--------|---------|
 | `LOG_LEVEL` | Sets the verbosity of the application's logs. | `info` (default), `debug` | `LOG_LEVEL: debug` |
-| `CONNECT_ALL` | Controls whether all TrueNAS-managed `ix-` apps should be automatically connected to the default `apps-internal` network. | `true`, `false` (default) | `CONNECT_ALL: "true"` |
+| `PROJECT_MATCH` | Regex a container's Compose project name must match for Dragonify to manage it. Containers not started by Compose are never managed. | `^ix-` (default, TrueNAS apps), `""` (every Compose project) | `PROJECT_MATCH: "^(ix-\|media-)"` |
+| `CONNECT_ALL` | Controls whether all managed apps should be automatically connected to the default `apps-internal` network. | `true`, `false` (default) | `CONNECT_ALL: "true"` |
 | `CUSTOMS_NETWORKS` | A comma-separated list of Docker networks that Dragonify should create on startup. This is useful for pre-defining networks you plan to use across multiple applications. | e.g. `media-net,home-automation-net` | `CUSTOMS_NETWORKS: apps-internal-custom,app-external` |
 | `REV_PROXY_NETWORKS` | Gives each reverse-proxied container a private network shared only with the reverse proxy, instead of one network every proxied app shares. See [Reverse proxy networks](#reverse-proxy-networks). | `false` (default), `true` | `REV_PROXY_NETWORKS: "true"` |
 | `REV_PROXY_NETWORK_LABEL` | Container label whose value names the container's reverse proxy network. Required when `REV_PROXY_NETWORKS` is `true`. | any label name | `REV_PROXY_NETWORK_LABEL: traefik.docker.network` |
