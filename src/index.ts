@@ -7,7 +7,7 @@ const CONNECT_ALL_ENABLE: string | undefined = process.env.CONNECT_ALL
 const CUSTOM_NETWORK_NAMES: string | undefined = process.env.CUSTOMS_NETWORKS
 const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
 const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
-const REV_PROXY_NETWORK_MATCH = new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "")
+const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "") : undefined
 const REV_PROXY_CONTAINER = process.env.REV_PROXY_CONTAINER
 if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
   throw new Error("REV_PROXY_NETWORKS=true needs REV_PROXY_NETWORK_LABEL and REV_PROXY_CONTAINER")
@@ -42,17 +42,7 @@ async function setUpNetwork(docker: Docker) {
     const NETWORK_NAME_exist = existingNetworks.find((thisnetwork: any) => thisnetwork.Name === NETWORK_NAME)
     if (NETWORK_NAME_exist) {
       logger.info(`Network "${NETWORK_NAME}" is present but CONNECT_ALL set to "False". This network will be remove.`)
-      const network = await docker.getNetwork(NETWORK_NAME_exist.Id).inspect()
-      const containers = network.Containers ?? {}
-
-      for (const containerID of Object.keys(containers)) {
-        await docker.getNetwork(network.Id).disconnect({ Container: containerID })
-        logger.debug(`Container "${containerID}" is now disconnected from "${network.Name}".`)
-      }
-
-      logger.debug(`Network "${network.Name}" is now empty and will be deleted.`)
-      await docker.getNetwork(network.Id).remove()
-
+      await removeNetwork(docker, NETWORK_NAME_exist.Id)
     }
   }
 
@@ -102,7 +92,7 @@ function prohibitedNetworkMode(networkMode: string) {
     networkMode.startsWith("service:")
 }
 
-async function connectContainerToAppsNetwork(docker: Docker, container: Docker.ContainerInfo, network_name: string) {
+async function connectToNetwork(docker: Docker, container: Docker.ContainerInfo, network_name: string) {
   if (prohibitedNetworkMode(container.HostConfig.NetworkMode)) {
     logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`)
     return
@@ -148,10 +138,12 @@ function isNetworkSpecified(container: Docker.ContainerInfo) {
 
 function getRevProxyNetwork(container: Docker.ContainerInfo) {
   const name = container.Labels[REV_PROXY_NETWORK_LABEL!]
-  return REV_PROXY_NETWORKS && name && REV_PROXY_NETWORK_MATCH.test(name) ? name : undefined
+  // A container sharing another's network stack (or none/host) can't join it.
+  return REV_PROXY_NETWORKS && name && REV_PROXY_NETWORK_MATCH!.test(name) &&
+    !prohibitedNetworkMode(container.HostConfig.NetworkMode) ? name : undefined
 }
 
-async function connectContainer(docker: Docker, container: Docker.ContainerInfo) {
+async function connectToAllNetworks(docker: Docker, container: Docker.ContainerInfo) {
   const networkList:string[] = []
   if (CONNECT_ALL !== "false" ) {
     logger.info(`${container.Names} will be connected to all others`)
@@ -181,7 +173,7 @@ async function connectContainer(docker: Docker, container: Docker.ContainerInfo)
       continue
     }
     logger.info(`Connecting ${container.Names} to "${network_name}"`)
-    await connectContainerToAppsNetwork(docker, container, network_name)
+    await connectToNetwork(docker, container, network_name)
   }
 
   if (revProxyNetwork) {
@@ -222,7 +214,7 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
 
   for (const container of containers.filter(isIxAppContainer)) {
     try {
-      await connectContainer(docker, container)
+      await connectToAllNetworks(docker, container)
     } catch (e: any) {
       logger.error(`Failed to connect ${container.Names} to its networks:`, e)
     }
@@ -244,31 +236,39 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
   }
 
   logger.debug(`New container started: ${container.Id}`)
-  await connectContainer(docker, container)
+  await connectToAllNetworks(docker, container)
 }
 
-async function removeEmptyCreatedNetwork(docker: Docker) {
-  const existingNetworks = await docker.listNetworks()
-  const dragonifyNetworks = existingNetworks.filter((thisnetwork: any) => thisnetwork.Labels["tj.horner.dragonify.networks"])
+// Disconnects every container still referencing the network, stopped ones
+// included (a stopped container can't start again once its network is gone),
+// then removes the network.
+async function removeNetwork(docker: Docker, networkId: string) {
+  const network = docker.getNetwork(networkId)
+  const users = await docker.listContainers({ all: true, filters: { network: [ networkId ] } })
+  for (const container of users) {
+    await network.disconnect({ Container: container.Id, Force: true })
+  }
+  await network.remove()
+}
 
-  for (const networkSummary of dragonifyNetworks) {
-    const network = await docker.getNetwork(networkSummary.Id).inspect()
-    const containers = network.Containers ?? {}
-    // A reverse proxy network counts as empty once only the reverse proxy is left on it.
-    const revProxyIds = network.Labels[REV_PROXY_NETWORK_OWNER_LABEL]
-      ? Object.keys(containers).filter(id => containers[id].Name === REV_PROXY_CONTAINER)
-      : []
-    const isEmpty = Object.keys(containers).length === revProxyIds.length
-    
-    if (isEmpty) {
-      logger.info(`Network "${network.Name}" is now empty and will be deleted.`)
-      for (const id of revProxyIds) {
-        await docker.getNetwork(network.Id).disconnect({ Container: id })
+// Removes Dragonify's networks that no container references any more. Stopped
+// containers count, so a stopped app keeps its networks until it is removed.
+async function removeUnusedNetworks(docker: Docker) {
+  const dragonifyNetworks = await docker.listNetworks({ filters: { label: [ "tj.horner.dragonify.networks" ] } })
+
+  for (const network of dragonifyNetworks) {
+    try {
+      const users = await docker.listContainers({ all: true, filters: { network: [ network.Id ] } })
+      // A reverse proxy network is unused once only the reverse proxy references it.
+      const others = users.filter(c => !(network.Labels?.[REV_PROXY_NETWORK_OWNER_LABEL] && c.Names.includes(`/${REV_PROXY_CONTAINER}`)))
+      if (others.length > 0) {
+        logger.debug(`Network "${network.Name}" is used by: ${others.flatMap(c => c.Names).join(", ")}`)
+        continue
       }
-      await docker.getNetwork(network.Id).remove()
-    }
-    else {
-      logger.debug(`Network "${network.Name}" contains containers : ${Object.keys(containers).join(", ")}`)
+      logger.info(`Network "${network.Name}" is no longer used and will be deleted.`)
+      await removeNetwork(docker, network.Id)
+    } catch (e: any) {
+      logger.error(`Failed to clean up network "${network.Name}":`, e)
     }
   }
 }
@@ -278,9 +278,9 @@ async function main() {
 
   await setUpNetwork(docker)
 
-  // Startup, start and stop handling run one at a time through this queue, so
-  // cleanup after one container stops can't delete a network that a starting
-  // container is about to join (compose does both at once on a redeploy).
+  // Startup, start and removal handling run one at a time through this queue,
+  // so cleanup after one container is removed can't delete a network that a
+  // starting container is about to join (compose does both on a redeploy).
   let queue = Promise.resolve()
   const enqueue = (task: string, work: () => Promise<unknown>) => {
     queue = queue.then(work).then(() => {}, e => { logger.error(`${task} failed:`, e) })
@@ -288,6 +288,7 @@ async function main() {
 
   const events = getEventStream(docker)
   enqueue("Connecting existing containers", () => connectAllContainersToAppsNetwork(docker))
+  enqueue("Network cleanup", () => removeUnusedNetworks(docker))
 
   events.on("container.start", (event) => {
     const containerAttributes = event.Actor.Attributes
@@ -303,13 +304,15 @@ async function main() {
     enqueue(`Connecting ${containerAttributes["name"]}`, () => connectNewContainerToAppsNetwork(docker, event.Actor["ID"]))
   })
 
-  events.on("container.stop", (event) => {
+  // Cleanup runs when a container is removed, not when it stops: a stopped
+  // container still references its networks and needs them to start again.
+  events.on("container.destroy", (event) => {
     const containerAttributes = event.Actor.Attributes
     if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
       return
     }
 
-    enqueue("Network cleanup", () => removeEmptyCreatedNetwork(docker))
+    enqueue("Network cleanup", () => removeUnusedNetworks(docker))
   })
 }
 

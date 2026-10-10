@@ -78,5 +78,5 @@ Point `REV_PROXY_NETWORK_LABEL` at the label your proxy already reads to pick a 
 
 - If a second container names the same network, Dragonify still connects it and logs a warning naming the first owner, since those containers can now reach each other.
 - A label value naming a network Dragonify didn't create, such as an existing shared network, is joined with a warning and never deleted. Set `REV_PROXY_NETWORK_MATCH` so such values don't match.
-- The network is removed once only the reverse proxy is left on it, and the reverse proxy is reconnected to every reverse proxy network when its container is recreated.
+- The network is removed once the app's containers are removed (for example when the app is deleted or redeployed). A stopped app keeps its network so it can start again. The reverse proxy is reconnected to every reverse proxy network when its container is recreated.
 - Services in the same app can still reach each other over the app's own default network unless its compose file separates them.
