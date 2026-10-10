@@ -3,8 +3,8 @@ import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
 const NETWORK_NAME = "apps-internal"
-const CONNECT_ALL_ENABLE: string | undefined = process.env.CONNECT_ALL
-const CUSTOM_NETWORK_NAMES: string | undefined = process.env.CUSTOMS_NETWORKS
+const CONNECT_ALL = (process.env.CONNECT_ALL ?? "false").toLowerCase()
+const CUSTOM_NETWORKS = process.env.CUSTOMS_NETWORKS?.split(",") ?? []
 const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
 const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
 const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "") : undefined
@@ -15,21 +15,6 @@ if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
 // Set on networks Dragonify creates for the reverse proxy; the value is the
 // project/service that first asked for the network.
 const REV_PROXY_NETWORK_OWNER_LABEL = "tj.horner.dragonify.rev-proxy-network"
-
-
-if (CONNECT_ALL_ENABLE !== undefined) {
-  var CONNECT_ALL: string | undefined = CONNECT_ALL_ENABLE.toLowerCase( )
-}
-else {
-  var CONNECT_ALL: string | undefined = "false"
-}
-var networks_liste: string[] = [NETWORK_NAME]
-if (CUSTOM_NETWORK_NAMES !== undefined) {
-  var networks_liste: string[] = CUSTOM_NETWORK_NAMES.split(',')
-}
-else {
-  var networks_liste: string[] = []
-}
 
 async function setUpNetwork(docker: Docker) {
   const networkList:string[] = []
@@ -46,14 +31,9 @@ async function setUpNetwork(docker: Docker) {
     }
   }
 
-  for (let i = 0; i < networks_liste.length; i++) {
-    networkList.push(networks_liste[i])
-  }
-
-  for (let i = 0; i < networkList.length; i++) {
-    logger.info(`Setting up network "${networkList[i]}"`)
-
-    await ensureNetwork(docker, networkList[i])
+  for (const network_name of [...networkList, ...CUSTOM_NETWORKS]) {
+    logger.info(`Setting up network "${network_name}"`)
+    await ensureNetwork(docker, network_name)
   }
 }
 
