@@ -3,9 +3,10 @@
 > 
 > This is an updated README for [casse-boubou/dragonify](https://github.com/casse-boubou/dragonify), a fork of the original [tjhorner/dragonify](https://github.com/tjhorner/dragonify)
 
-Dragonify is a utility for TrueNAS SCALE that enhances inter-app communication by automatically managing Docker networks. It allows containers to communicate with each other via DNS, restoring and extending the networking functionality available in previous TrueNAS versions. This updated version provides granular control over network creation and container connections, improving both flexibility and security.
+Dragonify is a utility for TrueNAS SCALE apps that manages Docker networks for you. It does two jobs:
 
-It's a stop-gap until inter-app networking is properly implemented.
+- **Inter-app networking:** it puts apps on shared networks and gives each one a DNS name, so apps can reach each other the way they could in earlier TrueNAS versions.
+- **Reverse proxy isolation:** it gives each app behind a reverse proxy such as Traefik a private network shared only with the proxy, so proxied apps can't reach each other's ports. Docker and TrueNAS have no built-in way to do this; see [Reverse proxy networks](#reverse-proxy-networks).
 
 > [!Warning]
 >
@@ -15,7 +16,7 @@ It's a stop-gap until inter-app networking is properly implemented.
 
 Dragonify listens to Docker events to automatically manage networks and container connections:
 
-- It create, manage, and delete Docker bridge networks. Networks created by Dragonify are labeled for automatic removal when they are no longer in use.
+- It creates and deletes Docker bridge networks. Networks it creates are labelled, and deleted once no container references them (stopped containers count, so a stopped app keeps its networks).
 - When a container is connected to a network, Dragonify assigns it a DNS alias in the format `{service}.{project}.svc.cluster.local`, allowing other containers on the same network to resolve its address by name.
 - You can use environment variables and container labels to customize how Dragonify behaves, from creating multiple isolated networks to controlling which containers get connected.
 - Only works on apps managed by TrueNAS Scale/CE UI, by checking for if the project/stack name in `com.docker.compose.project` property starts with `ix-`.
@@ -28,12 +29,10 @@ You can control Dragonify's behavior using a combination of environment variable
 
 These variables are set on the `dragonify` container itself.
 
-Here's the environment variables section as a table:
-
 | Variable | Description | Values | Example |
 |----------|-------------|--------|---------|
 | `LOG_LEVEL` | Sets the verbosity of the application's logs. | `info` (default), `debug` | `LOG_LEVEL: debug` |
-| `CONNECT_ALL` | Controls whether all TrueNAS-managed `ix-` apps should be automatically connected to the default `apps-internal` network. | `true` (default), `false` | `CONNECT_ALL: "false"` |
+| `CONNECT_ALL` | Controls whether all TrueNAS-managed `ix-` apps should be automatically connected to the default `apps-internal` network. | `true`, `false` (default) | `CONNECT_ALL: "true"` |
 | `CUSTOMS_NETWORKS` | A comma-separated list of Docker networks that Dragonify should create on startup. This is useful for pre-defining networks you plan to use across multiple applications. | e.g. `media-net,home-automation-net` | `CUSTOMS_NETWORKS: apps-internal-custom,app-external` |
 | `REV_PROXY_NETWORKS` | Gives each reverse-proxied container a private network shared only with the reverse proxy, instead of one network every proxied app shares. See [Reverse proxy networks](#reverse-proxy-networks). | `false` (default), `true` | `REV_PROXY_NETWORKS: "true"` |
 | `REV_PROXY_NETWORK_LABEL` | Container label whose value names the container's reverse proxy network. Required when `REV_PROXY_NETWORKS` is `true`. | any label name | `REV_PROXY_NETWORK_LABEL: traefik.docker.network` |
