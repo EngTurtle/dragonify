@@ -2,16 +2,24 @@ import Docker from "dockerode"
 import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
+function envRegex(name: string, fallback: string) {
+  try {
+    return new RegExp(process.env[name] ?? fallback)
+  } catch (e: any) {
+    throw new Error(`${name} is not a valid regex: ${e.message}`)
+  }
+}
+
 const NETWORK_NAME = "apps-internal"
 // Compose projects Dragonify manages; TrueNAS names its apps' projects ix-*.
-const PROJECT_MATCH = new RegExp(process.env.PROJECT_MATCH ?? "^ix-")
+const PROJECT_MATCH = envRegex("PROJECT_MATCH", "^ix-")
 const CONNECT_ALL = (process.env.CONNECT_ALL ?? "false").toLowerCase()
 const CUSTOM_NETWORKS = process.env.CUSTOMS_NETWORKS?.split(",") ?? []
 // Created at startup for containers to join later, so never cleaned up.
 const STARTUP_NETWORKS = CONNECT_ALL !== "false" ? [NETWORK_NAME, ...CUSTOM_NETWORKS] : CUSTOM_NETWORKS
 const REV_PROXY_NETWORKS = process.env.REV_PROXY_NETWORKS?.toLowerCase() === "true"
 const REV_PROXY_NETWORK_LABEL = process.env.REV_PROXY_NETWORK_LABEL
-const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? new RegExp(process.env.REV_PROXY_NETWORK_MATCH ?? "") : undefined
+const REV_PROXY_NETWORK_MATCH = REV_PROXY_NETWORKS ? envRegex("REV_PROXY_NETWORK_MATCH", "") : undefined
 const REV_PROXY_CONTAINER = process.env.REV_PROXY_CONTAINER
 if (REV_PROXY_NETWORKS && (!REV_PROXY_NETWORK_LABEL || !REV_PROXY_CONTAINER)) {
   throw new Error("REV_PROXY_NETWORKS=true needs REV_PROXY_NETWORK_LABEL and REV_PROXY_CONTAINER")
